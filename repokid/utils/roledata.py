@@ -11,6 +11,7 @@
 #     WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #     See the License for the specific language governing permissions and
 #     limitations under the License.
+from collections import namedtuple
 import copy
 import datetime
 from dateutil.tz import tzlocal
@@ -27,6 +28,9 @@ from repokid.role import Role
 
 IAM_ACCESS_ADVISOR_UNSUPPORTED_SERVICES = frozenset(['lightsail', 'organizations'])
 IAM_ACCESS_ADVISOR_UNSUPPORTED_ACTIONS = frozenset(['iam:passrole'])
+
+# permission decisions have the form repoable - boolean, and decider - string
+RepoablePermissionDecision = namedtuple('RepoablePermissionDecision', ['repoable', 'decider'])
 
 
 def add_new_policy_version(dynamo_table, role, current_policy, update_source):
@@ -279,11 +283,18 @@ def _get_repoable_permissions(role_name, permissions, aa_data, no_repo_permissio
     Returns:
         set: Permissions that are 'repoable' (not used within the time threshold)
     """
+    # TODO - update docstring
+
     ago = datetime.timedelta(minimum_age)
     now = datetime.datetime.now(tzlocal())
 
     current_time = time.time()
     no_repo_list = [perm.lower() for perm in no_repo_permissions if no_repo_permissions[perm] > current_time]
+
+    # cast all permissions to lowercase
+    permissions = [permission.lower() for permission in permissions]
+    potentially_repoable_permissions = {permission: RepoablePermissionDecision(repoable=None, decider='')
+                                        for permission in permissions if permission not in no_repo_list}
 
     used_services = set()
     for service in aa_data:
@@ -294,8 +305,7 @@ def _get_repoable_permissions(role_name, permissions, aa_data, no_repo_permissio
         if accessed > now - ago:
             used_services.add(service['serviceNamespace'])
 
-    repoable_permissions = set()
-    for permission in permissions:
+    for permission in potentially_repoable_permissions:
         if permission.split(':')[0] in IAM_ACCESS_ADVISOR_UNSUPPORTED_SERVICES:
             LOGGER.warn('skipping {}'.format(permission))
             continue
@@ -306,18 +316,18 @@ def _get_repoable_permissions(role_name, permissions, aa_data, no_repo_permissio
                 LOGGER.warn('skipping {}'.format(permission))
                 continue
 
-            if permission.lower() in no_repo_list:
-                LOGGER.info('skipping {} for role {} because it is in the no repo list'.format(permission, role_name))
-                continue
-
-            repoable_permissions.add(permission.lower())
+            permission.repoable = True
+            permission.decider = 'Access Advisor'
 
     hooks_output = repokid.hooks.call_hooks(hooks, 'DURING_REPOABLE_CALCULATION',
-                                            {'role_name': role_name, 'permissions': repoable_permissions,
-                                             'aa_data': aa_data, 'no_repo_permissions': no_repo_permissions,
+                                            {'role_name': role_name,
+                                             'potentially_repoable_permissions': potentially_repoable_permissions,
                                              'minimum_age': minimum_age})
 
-    return hooks_output['permissions']
+    # TODO: make option to show source of repoable?
+
+    return set([permission_name for permission_name, permission_value in
+                hooks_output['potentially_repoable_permissions'].items() if permission_value.repoable])
 
 
 def _get_repoed_policy(policies, repoable_permissions):
@@ -380,6 +390,32 @@ def _get_repoed_policy(policies, repoable_permissions):
     return role_policies, empty_policies
 
 
+def _get_permissions_in_policy(policy_dict, warn_unknown_perms=False):
+    """
+    Given a set of policies for a role, return a set of all allowed permissions
+
+    Args:
+        policy_dict
+        warn_unknown_perms
+
+    Returns
+        set - all permissions allowed by the policies
+    """
+    permissions = set()
+
+    for policy_name, policy in policy_dict.items():
+        policy = expand_policy(policy=policy, expand_deny=False)
+        for statement in policy.get('Statement'):
+            if statement['Effect'].lower() == 'allow':
+                permissions = permissions.union(get_actions_from_statement(statement))
+
+    weird_permissions = permissions.difference(all_permissions)
+    if weird_permissions and warn_unknown_perms:
+        LOGGER.warn('Unknown permissions found: {}'.format(weird_permissions))
+
+    return permissions
+
+
 def _get_role_permissions(role, warn_unknown_perms=False):
     """
     Expand the most recent version of policies from a role to produce a list of all the permissions that are allowed
@@ -394,16 +430,25 @@ def _get_role_permissions(role, warn_unknown_perms=False):
     Returns:
         set: A set of permissions that the role has policies that allow
     """
-    permissions = set()
+    return _get_permissions_in_policy(role.policies[-1]['Policy'])
 
-    for policy_name, policy in role.policies[-1]['Policy'].items():
-        policy = expand_policy(policy=policy, expand_deny=False)
-        for statement in policy.get('Statement'):
-            if statement['Effect'].lower() == 'allow':
-                permissions = permissions.union(get_actions_from_statement(statement))
 
-    weird_permissions = permissions.difference(all_permissions)
-    if weird_permissions and warn_unknown_perms:
-        LOGGER.warn('Unknown permissions found: {}'.format(weird_permissions))
+def _get_services_in_permissions(permissions_set):
+    """
+    Given a set of permissions, return a sorted set of services
 
-    return permissions
+    Args:
+        permissions_set
+
+    Returns:
+        services_set
+    """
+    services_set = set()
+    for permission in permissions_set:
+        try:
+            service = permission.split(':')[0]
+        except IndexError:
+            pass
+        else:
+            services_set.add(service)
+    return sorted(services_set)
